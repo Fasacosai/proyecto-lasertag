@@ -1,0 +1,295 @@
+#include <msp430.h>
+
+// === Prototipos de funciones ===
+void configurar_DCO_16MHz(void);           // Reloj principal a 16 MHz
+void configurar_UART(void);                // UART a 1200 baudios
+void configurar_PWM_38kHz(void);           // PWM para IR a 38 kHz
+void configurar_timer1s(void);             // Timer para 1 segundo (LED P1.0)
+void configurar_temporizadores(void);      // Timers para multiplexado y lógica
+void enviar_UART(char c);                  // Enviar un carácter por UART
+void activar_salida_PWM(void);             // Habilitar salida IR
+void desactivar_salida_PWM(void);          // Deshabilitar salida IR
+void configurar_puertos(void);             // Entradas/salidas generales
+void mostrar_segmentos(unsigned char);     // Mostrar número en 7 segmentos
+void procesar_multiplexado(void);          // Alternar entre vidas/balas
+void procesar_tiempo(void);                // Control de LED y recarga
+
+// === Variables globales ===
+volatile unsigned char boton_presionado = 0;
+volatile unsigned char vidas = 3;
+volatile unsigned char balas = 15;
+volatile unsigned char mostrar_display = 0;
+volatile unsigned char led_activo = 0;
+volatile unsigned int contador_led = 0;
+volatile unsigned char bandera_multiplexado = 0;
+volatile unsigned char bandera_tiempo = 0;
+volatile unsigned int contador_recarga = 0;
+volatile unsigned char esperando_recarga = 0;
+
+// === Tabla de segmentos (común cátodo) ===
+const unsigned char mapa_segmentos[16] = {
+    0b1111110, 0b0110000, 0b1101101, 0b1111001,
+    0b0110011, 0b1011011, 0b1011111, 0b1110000,
+    0b1111111, 0b1111011, 0b1110111, 0b0011111,
+    0b1001110, 0b0111101, 0b1001111, 0b1000111
+};
+
+// === Función principal ===
+void main(void) {
+    WDTCTL = WDTPW | WDTHOLD;              // Desactivar watchdog
+    configurar_DCO_16MHz();                // Reloj a 16 MHz
+    configurar_UART();                     // UART 1200 baudios
+    configurar_PWM_38kHz();                // PWM 38 kHz
+    configurar_timer1s();                  // Timer LED 1s
+    configurar_puertos();                  // I/O y botones
+    configurar_temporizadores();           // Timers multiplexado y lógica
+    __enable_interrupt();                  // Habilitar interrupciones
+
+    while (1) {
+        if (bandera_multiplexado) {
+            bandera_multiplexado = 0;
+            procesar_multiplexado();       // Alternar display
+        }
+
+        if (bandera_tiempo) {
+            bandera_tiempo = 0;
+            procesar_tiempo();             // LED y recarga
+        }
+
+        if (boton_presionado) {
+            boton_presionado = 0;
+
+            // Si está recargando o LED disparo activo, ignorar
+            if (esperando_recarga || led_activo) {
+                P1IE |= BIT3;
+                continue;
+            }
+
+            __delay_cycles(16000);         // Antirrebote
+
+            // Si botón sigue presionado y hay balas
+            if (!(P1IN & BIT3) && balas > 0) {
+                balas--;
+                activar_salida_PWM();
+                __delay_cycles(160000);    // Pulso corto
+                enviar_UART(6);            // Enviar disparo
+                __delay_cycles(320000);
+                desactivar_salida_PWM();
+
+                P2OUT |= BIT0;             // LED disparo
+                led_activo = 1;
+                contador_led = 0;
+
+                if (balas == 0) {
+                    esperando_recarga = 1;
+                    contador_recarga = 0;
+                }
+            }
+
+            P1IE |= BIT3;
+        }
+
+        __low_power_mode_0();              // Ahorro de energía
+    }
+}
+
+// === Configuraciones ===
+
+void configurar_DCO_16MHz(void) {
+    UCSCTL3 = SELREF_2;
+    UCSCTL4 |= SELA_2;
+    __bis_SR_register(SCG0);
+    UCSCTL1 = DCORSEL_5;
+    UCSCTL2 = 487;
+    __bic_SR_register(SCG0);
+    __delay_cycles(500000);
+}
+
+void configurar_UART(void) {
+    P3SEL |= BIT3 + BIT4;                 // UART TX/RX
+    UCA0CTL1 |= UCSWRST;
+    UCA0CTL1 |= UCSSEL_1;                 // ACLK = 32.768 kHz
+    UCA0BR0 = 27;
+    UCA0BR1 = 0;
+    UCA0MCTL = UCBRS_0;
+    UCA0CTL1 &= ~UCSWRST;
+    UCA0IE |= UCRXIE;                     // Interrupción RX
+}
+
+void configurar_PWM_38kHz(void) {
+    P2DIR |= BIT4;
+    P2SEL |= BIT4;                        // PWM por TA2.1
+    TA2CCR0 = 421;
+    TA2CCR1 = 210;
+    TA2CCTL1 = OUTMOD_7;
+    TA2CTL = TASSEL_2 | MC_1;             // SMCLK, up mode
+}
+
+void activar_salida_PWM(void) {
+    P2SEL |= BIT4;
+}
+
+void desactivar_salida_PWM(void) {
+    P2SEL &= ~BIT4;
+}
+
+void configurar_timer1s(void) {
+    TA0CCR0 = 32768 - 1;
+    TA0CCTL0 = CCIE;
+    TA0CTL = TASSEL_1 | MC_0 | TACLR;     // ACLK, detenido
+}
+
+void configurar_temporizadores(void) {
+    TA1CCR0 = 32000 - 1;                  // Timer multiplexado (~2ms)
+    TA1CCTL0 = CCIE;
+    TA1CTL = TASSEL_2 | MC_1 | TACLR;
+
+    TA2CCR0 = 16000 - 1;                  // Timer lógica (1ms)
+    TA2CCTL0 = CCIE;
+    TA2CTL |= TASSEL_2 | MC_1 | TACLR;
+}
+
+void configurar_puertos(void) {
+    // Salidas segmentos
+    P6DIR |= BIT1 | BIT2 | BIT3 | BIT4 | BIT5 | BIT6;
+    P1DIR |= BIT6;
+    P6OUT &= ~(BIT1 | BIT2 | BIT3 | BIT4 | BIT5 | BIT6);
+    P1OUT &= ~BIT6;
+
+    // Control displays
+    P8DIR |= BIT1;
+    P3DIR |= BIT7;
+    P8OUT &= ~BIT1;
+    P3OUT &= ~BIT7;
+
+    // Botón disparo en P1.3
+    P1DIR &= ~BIT3;
+    P1REN |= BIT3;
+    P1OUT |= BIT3;
+    P1IE |= BIT3;
+    P1IES |= BIT3;
+    P1IFG &= ~BIT3;
+
+    // LED disparo
+    P2DIR |= BIT0;
+    P2OUT &= ~BIT0;
+
+    // LED vida P1.0
+    P1DIR |= BIT0;
+    P1OUT &= ~BIT0;
+}
+
+// === Visualización ===
+
+void mostrar_segmentos(unsigned char valor) {
+    P6OUT &= ~(BIT1 | BIT2 | BIT3 | BIT4 | BIT5 | BIT6);
+    P1OUT &= ~BIT6;
+
+    if (valor & 0b1000000) P6OUT |= BIT1;
+    if (valor & 0b0100000) P6OUT |= BIT2;
+    if (valor & 0b0010000) P6OUT |= BIT3;
+    if (valor & 0b0001000) P6OUT |= BIT4;
+    if (valor & 0b0000100) P6OUT |= BIT5;
+    if (valor & 0b0000010) P6OUT |= BIT6;
+    if (valor & 0b0000001) P1OUT |= BIT6;
+}
+
+void procesar_multiplexado(void) {
+    if (mostrar_display == 0) {
+        mostrar_segmentos(mapa_segmentos[vidas]);
+        P8OUT |= BIT1;                     // Activar display vidas
+        P3OUT &= ~BIT7;
+        mostrar_display = 1;
+    } else {
+        mostrar_segmentos(mapa_segmentos[balas]);
+        P3OUT |= BIT7;                     // Activar display balas
+        P8OUT &= ~BIT1;
+        mostrar_display = 0;
+    }
+}
+
+void procesar_tiempo(void) {
+    // Apagar LED disparo tras 1 s
+    if (led_activo) {
+        contador_led++;
+        if (contador_led >= 1000) {
+            P2OUT &= ~BIT0;
+            led_activo = 0;
+            contador_led = 0;
+        }
+    }
+
+    // Recarga automática tras 10 s sin balas
+    if (esperando_recarga) {
+        contador_recarga++;
+        if ((contador_recarga % 500) == 0)
+            P2OUT ^= BIT0;                 // Parpadeo recarga
+
+        if (contador_recarga >= 10000) {
+            balas = 15;
+            esperando_recarga = 0;
+            contador_recarga = 0;
+            P2OUT &= ~BIT0;                // Detener parpadeo
+        }
+    }
+}
+
+void enviar_UART(char c) {
+    while (!(UCA0IFG & UCTXIFG));
+    UCA0TXBUF = c;
+}
+
+// === Interrupciones ===
+
+#pragma vector=PORT1_VECTOR
+__interrupt void ISR_Puerto1(void) {
+    if (P1IFG & BIT3) {
+        boton_presionado = 1;
+        P1IE &= ~BIT3;
+        P1IFG &= ~BIT3;
+    }
+}
+
+#pragma vector=USCI_A0_VECTOR
+__interrupt void USCI_A0_ISR(void) {
+    if (UCA0IV == 2) {
+        char recibido = UCA0RXBUF;
+
+        // Valores que restan vidas
+        if (recibido == 2 || recibido == 4 || recibido == 5 || recibido == 6 || recibido == 7 ||
+            recibido == 9 || recibido == 12 || recibido == 15 || recibido == 16 || recibido == 17 ||
+            recibido == 19 || recibido == 23 || recibido == 24 || recibido == 25 || recibido == 27) {
+
+            if (vidas > 0) {
+                vidas--;
+                P1OUT |= BIT0;             // LED vida
+                bandera_multiplexado = 1;
+                enviar_UART('0' + vidas);  // Enviar nueva vida
+            }
+
+            // Timer para apagar LED
+            TA0CTL = TASSEL_1 | MC_1 | TACLR;
+        }
+    }
+}
+
+#pragma vector=TIMER0_A0_VECTOR
+__interrupt void TIMER0_A0_ISR(void) {
+    P1OUT &= ~BIT0;        // Apagar LED vida
+    TA0CTL &= ~MC_3;
+    TA0R = 0;
+    TA0CCTL0 &= ~CCIFG;
+    __bic_SR_register_on_exit(LPM0_bits);
+}
+
+#pragma vector=TIMER1_A0_VECTOR
+__interrupt void TIMER1_A0_ISR(void) {
+    bandera_multiplexado = 1;
+    __bic_SR_register_on_exit(LPM0_bits);
+}
+
+#pragma vector=TIMER2_A0_VECTOR
+__interrupt void TIMER2_A0_ISR(void) {
+    bandera_tiempo = 1;
+    __bic_SR_register_on_exit(LPM0_bits);
+}
